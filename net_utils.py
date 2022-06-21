@@ -1,13 +1,16 @@
 import os, time, importlib, errno
 import matplotlib.pyplot as plt 
 
-from dt_utils import Timer
+import numpy as np
+
+# from dt_utils import Timer
 #from networks import HebbDiags
 
 import torch
 from torch import nn
 from torch.nn import functional as F
 from torch.utils.tensorboard import SummaryWriter
+from torch.utils.data import TensorDataset
 
 #%%#################
 ### Base Classes ###
@@ -22,10 +25,11 @@ class NetworkBase(nn.Module):
         self.name = self.__class__.__name__
         self.loss_fn = None 
         self.acc_fn = None
-    
+        self.learning_rate = None
+        self.verbose = True
     
     def fit(self, train_fn, *args, **kwargs):
-        if train_fn == 'dataset':
+        if train_fn in ('dataset', 'sequence',):
             train_fn = train_dataset            
         elif train_fn == 'infinite':
             train_fn = train_infinite           
@@ -37,7 +41,29 @@ class NetworkBase(nn.Module):
             pass        
         else:
             ValueError("train_fn must be a function or valid keyword")
-            
+        
+        # If anything about the training has changed, this should be triggered to mark a transition.
+        # Mostly this is important for computing early stop conditions, to make sure the network is not
+        # comparing loss on the new set to loss computed from the old set.
+        self.newThresh = kwargs.pop('newThresh', True)
+
+        self.learning_rate = kwargs.pop('learningRate', 1e-3)
+        init_string = 'Train parameters:'
+        init_string += '\n  Loss: XE // LR: {:.2e} '.format(self.learning_rate)
+
+        self.weightReg = kwargs.pop('weightReg', None)
+        self.regLambda = kwargs.pop('regLambda', None)
+        if self.weightReg is not None:
+            init_string += '// Weight reg: {}, coef: {:.1e} '.format(self.weightReg, self.regLambda)      
+        else:
+            init_string += '// Weight reg: None '
+
+        self.gradientClip = kwargs.pop('gradientClip', None)
+        if self.gradientClip is not None:
+            init_string += '// Gradient clip: {:.1e}'.format(self.gradientClip)      
+        else:
+            init_string += '// Gradient clip: None'
+
         folder = os.path.normpath(kwargs.pop('folder', ''))
         filename = kwargs.pop('filename', None)
         if filename is not None and not os.path.commonprefix([os.getcwd()[::-1],folder[::-1]]):
@@ -55,38 +81,73 @@ class NetworkBase(nn.Module):
             if not os.path.commonprefix([os.getcwd()[::-1],folder[::-1]]):
                 writerPath = os.path.join(folder, writerPath)
             self.writer = SummaryWriter(writerPath) #remove extension from filename
-                
-        self.optimizer = torch.optim.Adam(self.parameters(), lr=kwargs.pop('learningRate', 1e-3))       
+
+        if self.verbose and self.newThresh: # Only prints training details if newThreshold
+            print(init_string)
+
+        self.mointorFreq = kwargs.pop('monitorFreq', 10)        
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)       
         self.train() #put Module in train mode (e.g. for dropout)
-        with Timer() as timer:
-            train_fn(self, *args, **kwargs)                   
+        # with Timer() as timer:
+        early_stop = train_fn(self, *args, **kwargs)                   
         self.eval() #put Module back in evaluation mode
         
         self.autosave(force=True)
-        self.hist['time'] = timer.elapsed        
+        # self.hist['time'] = timer.elapsed 
 
+        return early_stop       
     
-    def _train_epoch(self, trainData, validBatch=None, batchSize=1, earlyStop=True, earlyStopValid=False, validStopThres=None):
-        for b in range(0, trainData.tensors[0].shape[1], 1 if batchSize is None else batchSize):  #trainData is shape [T,D,N]
-            trainBatch = trainData[:,b,:] if batchSize is None else trainData[:,b:b+batchSize,:] 
+    def _train_epoch(self, trainData, validBatch=None, batchSize=1, earlyStop=True, earlyStopValid=False, validStopThres=None, 
+                     trainOutputMask=None, validOutputMask=None, minMaxIter=(-2, 1e7)):
+        # print('New epoch...')
+        for b in range(0, trainData.tensors[0].shape[0], batchSize):  #trainData.tensors[0] is shape [B,T,Nx]
+            trainBatch = trainData[b:b+batchSize,:,:] 
             
+            if trainOutputMask is not None: 
+                trainOutputMaskBatch = trainOutputMask[b:b+batchSize,:,:] 
+            else:
+                trainOutputMaskBatch = None
+
             self.optimizer.zero_grad()
-            out = self.evaluate(trainBatch) #expects shape [T,batchSize,N] or [T,N] if batchSize=None
-            loss = self.average_loss(trainBatch, out=out)            
+
+            out = self.evaluate(trainBatch) #expects shape [B,T,Nx], out: [B,T,Ny]
+            loss = self.average_loss(trainBatch, out=out, outputMask=trainOutputMaskBatch)
             loss.backward()
+
+            if self.gradientClip is not None:
+                torch.nn.utils.clip_grad_norm_(self.parameters(), self.gradientClip)
+
             self.optimizer.step() 
             
-            self._monitor(trainBatch, validBatch=validBatch, out=out, loss=loss)  
-            
-            if earlyStopValid and len(self.hist['valid_loss'])>1 and self.hist['valid_loss'][-1] > self.hist['valid_loss'][-2]:
-                return True
-            if validStopThres is not None and self.hist['valid_acc'][-1]>validStopThres:
-                return True
-            if earlyStop and sum(self.hist['train_acc'][-5:]) >= 4.99: #not a proper early-stop criterion but useful for infinite data regime
-                return True
-        return False
-                       
-    
+            # Note: even though this is called every batch, only runs validation batch every monitor_freq batches
+            self._monitor(trainBatch, validBatch=validBatch, out=out, loss=loss, trainOutputMaskBatch=trainOutputMaskBatch, validOutputMask=validOutputMask) 
+            # self._monitor(trainBatch, validBatch=validBatch, trainOutputMaskBatch=trainOutputMaskBatch, validOutputMask=validOutputMask)  
+ 
+            # if earlyStopValid and len(self.hist['valid_loss'])>1 and self.hist['valid_loss'][-1] > self.hist['valid_loss'][-2]:
+            STEPS_BACK = 10
+            # Stop if the avg_valid_loss has asymptoted (or starts to increase)
+            # (since rolling average is 10 monitors, 2*STEPS_BACK makes sure there are two full averages available for comparison,
+            #  subtracting self.hist['monitor_thresh'][-1] prevents this threshold from being tested when a network continues training,)
+            if self.hist['iter'] > minMaxIter[0]: # Only early stops when above minimum iteration count
+                if earlyStopValid and (len(self.hist['iters_monitor']) - self.hist['monitor_thresh'][-1]) > 2*STEPS_BACK:
+                    if 1.0 * self.hist['avg_valid_loss'][-STEPS_BACK] < self.hist['avg_valid_loss'][-1]:
+                        print('  Early Stop: avg_valid_loss saturated, current (-1): {:.2e}, prev (-{}): {:.2e}, acc: {:.2f}'.format(
+                            self.hist['avg_valid_loss'][-1], STEPS_BACK, self.hist['avg_valid_loss'][-STEPS_BACK], self.hist['avg_valid_acc'][-1]))
+                        return True
+                if validStopThres is not None and self.hist['avg_valid_acc'][-1] > validStopThres:
+                    print('  Early Stop: valid accuracy threshold reached: {:.2f}'.format(
+                        self.hist['avg_valid_acc'][-1]
+                    ))
+                    return True
+                if self.hist['iter'] > minMaxIter[1]: # Early stop if above maximum numbers of iters
+                    print('  Early Stop: maximum iterations reached, acc: {:.2f}'.format(
+                        self.hist['avg_valid_acc'][-1]
+                    ))
+                    return True
+            # if earlyStop and sum(self.hist['train_acc'][-5:]) >= 4.99: #not a proper early-stop criterion but useful for infinite data regime
+            #     return True
+        return False  
+
     def evaluate(self, batch): #TODO: figure out nice way to infer shape of y and don't pass in
         """batch is (X,Y) tuple of Tensors, with X.shape=[T,B,N] or [T,N], Y.shape=[T,1]"""
         #TODO: automatically call batched (if it exists) or per-sample version of forward()
@@ -101,73 +162,147 @@ class NetworkBase(nn.Module):
         raise NotImplementedError
 
 
-    def accuracy(self, batch, out=None):
+    def accuracy(self, batch, out=None, outputMask=None):
         """batch is (x,y) tuple of Tensors, with x.shape=[T,B,Nx] or [T,Nx]"""
         if out is None:
             out = self.evaluate(batch)
-        return self.acc_fn(out, batch[1])
-   
-                
-    def average_loss(self, batch, out=None):
+        if outputMask is None:
+            return self.acc_fn(out, batch[1])
+        else: # Modify output by the mask
+            masked_y = batch[1][outputMask[:, :, 0]].squeeze(-1) # [B*T_mask, 1] -> [B*T_mask]
+            masked_out = out[outputMask[:, :, 0]] # [B*T_mask, Ny]
+
+            return self.acc_fn(masked_out, masked_y)
+
+
+    def average_loss(self, batch, out=None, outputMask=None):
         """batch is (x,y) tuple of Tensors, with x.shape=[T,B,Nx] or [T,Nx]"""
+        B = batch[0].shape[0]
         if out is None:
             out = self.evaluate(batch)
-        return self.loss_fn(out, batch[1])
+        
+        # Computes regularization term
+        if self.weightReg in ('L1', 'L2'):
+            # Omits certain paramters from regularization (e.g. sigma and eta in HebbNets)
+            p_reg = []
+            for p in self.parameters():
+                if torch.prod(torch.tensor(p.shape)) > 1:
+                    p_reg.append(p)
     
+            if self.weightReg == 'L2':
+                l2_norm = sum(p.pow(2.0).sum()
+                              for p in p_reg)
+                reg_term = self.regLambda * l2_norm/2
+            elif self.weightReg == 'L1':
+                l1_norm = sum(p.abs().sum()
+                              for p in p_reg)
+                reg_term = self.regLambda * l1_norm
+                # print('Batch size: {}, L1 Norm {:0.5f}, Reg Term {:0.5f}'.format(B, l1_norm, reg_term))
+        else:
+            reg_term = 0.0
+
+        if outputMask is None:
+            print('XE probably wont work here')
+            return self.loss_fn(out, batch[1]) + reg_term
+        else: # Modify output by the mask
+            # Last index of outputMask not needed because labels are [B, T]
+            masked_y = batch[1][outputMask[:, :, 0]].squeeze(-1) # [B*T_mask, 1] -> [B*T_mask]
+            masked_out = out[outputMask[:, :, 0]] # [B*T_mask, Ny]
+
+            # print('outputMask shape:', outputMask.shape)
+            # print('out shape:', out.shape)
+            # print('y shape:', batch[1].shape)
+            # print('masked out shape:', masked_out.shape)
+            # print('masked y shape:', masked_y.shape)
+
+            # print('masked out:', masked_out)
+            # print('masked y:', masked_y)
+
+            # print('type masked out:', masked_out.type())
+            # print('type masked y:', masked_y.type())
+
+            # Flatten over batch and temporal indices
+            return self.loss_fn(masked_out, masked_y) + reg_term
+
     
     @torch.no_grad()
-    def _monitor_init(self, trainBatch, validBatch=None):
-        if self.hist is None:
-            self.hist = {'epoch' : 0,
-                         'iter' : -1, #gets incremented when _monitor() is called
-                         'train_loss' : [], 
-                         'train_acc' : [],
-                         'grad_norm': []}
+    def _monitor_init(self, trainBatch, validBatch=None, trainOutputMaskBatch=None, validOutputMask=None):
+        if self.hist is None: # Initialize self.hist if needed
+            self.hist = {}
+        if 'epoch' not in self.hist: # This allows self.hist to be initialized in children classes first, and then all default keys are added here  
+            self.hist['epoch'] = 0
+            self.hist['iter'] = -1 # gets incremented when _monitor() is called
+            self.hist['iters_monitor'] =  []
+            self.hist['monitor_thresh'] =  [0,] # used to calculate rolling average loss/accuracy
+            self.hist['train_loss'] =  [] 
+            self.hist['train_acc'] =  []
+            self.hist['grad_norm'] =  []
+
             if validBatch:
                 self.hist['valid_loss'] = []
                 self.hist['valid_acc']  = []
+                self.hist['avg_valid_loss'] = []
+                self.hist['avg_valid_acc']  = []
                 
-            self._monitor(trainBatch, validBatch=validBatch)
+            self._monitor(trainBatch, validBatch=validBatch, trainOutputMaskBatch=trainOutputMaskBatch, validOutputMask=validOutputMask)
         else: 
-            print('Network already partially trained. Continuing from iter {}'.format(self.hist['iter']))    
-       
+            if self.verbose:
+                print('Network already partially trained. Last iter {}'.format(self.hist['iter']))    
+
+            # Will be used in _monitor to calculate the rolling loss relative to new iter value
+            self.hist['monitor_thresh'].append(len(self.hist['iters_monitor']))
+            # Does an initial monitor to prevent immediate stopping based off of parameters
+            self._monitor(trainBatch, validBatch=validBatch, trainOutputMaskBatch=trainOutputMaskBatch, validOutputMask=validOutputMask, runValid=True)
+
 
     @torch.no_grad()
-    def _monitor(self, trainBatch, validBatch=None, out=None, loss=None, acc=None):  
+    def _monitor(self, trainBatch, validBatch=None, out=None, loss=None, acc=None, trainOutputMaskBatch=None, validOutputMask=None, runValid=False):  
         #TODO: rewrite with same format as SummaryWriter and automatically write to both 
         self.hist['iter'] += 1 
         
-        if self.hist['iter']%10 == 0: #TODO: allow choosing monitoring interval
+        if self.hist['iter']%self.mointorFreq == 0 or runValid: #TODO: allow choosing monitoring interval
             if out is None:
                 out = self.evaluate(trainBatch)                
             if loss is None:
-                loss = self.average_loss(trainBatch, out)
+                loss = self.average_loss(trainBatch, out, outputMask=trainOutputMaskBatch)
             if acc is None:
-                acc = self.accuracy(trainBatch, out)
+                acc = self.accuracy(trainBatch, out, outputMask=trainOutputMaskBatch)
             gradNorm = self.grad_norm()
             
-            self.hist['train_loss'].append( loss.item() )
-            self.hist['train_acc'].append( acc.item() ) 
-            self.hist['grad_norm'].append( gradNorm )            
+            self.hist['iters_monitor'].append(self.hist['iter'])
+            self.hist['train_loss'].append(loss.item())
+            self.hist['train_acc'].append(acc.item()) 
+            self.hist['grad_norm'].append(gradNorm)            
             if hasattr(self, 'writer'):
                 self.writer.add_scalar('train/loss', loss.item(), global_step=self.hist['iter'])   
                 self.writer.add_scalar('train/acc', acc.item(), global_step=self.hist['iter'])   
                 self.writer.add_scalar('info/grad_norm', gradNorm, global_step=self.hist['iter'])
-            displayStr = 'Iter:{} grad:{:.1f} train_loss:{:.4f} train_acc:{:.3f}'.format(self.hist['iter'], gradNorm, loss, acc)                    
+            displayStr = 'Iter:{} grad:{:.3f} train_loss:{:.4f} train_acc:{:.3f}'.format(self.hist['iter'], gradNorm, loss, acc)                    
             
             if validBatch is not None:
-                out = self.evaluate(validBatch)
-                loss = self.average_loss(validBatch, out=out)  
-                acc = self.accuracy(validBatch, out=out) 
+                valid_out = self.evaluate(validBatch)
+                valid_loss = self.average_loss(validBatch, out=valid_out, outputMask=validOutputMask)  
+                valid_acc = self.accuracy(validBatch, out=valid_out, outputMask=validOutputMask) 
                 
-                self.hist['valid_loss'].append( loss.item() )                
-                self.hist['valid_acc'].append( acc.item() )  
+                self.hist['valid_loss'].append(valid_loss.item())                
+                self.hist['valid_acc'].append(valid_acc.item())
+
+                # Rolling average values, with adjustable window to account for early training times
+                N_AVG_WINDOW = 10
+                avg_window = min((N_AVG_WINDOW, len(self.hist['iters_monitor'])-self.hist['monitor_thresh'][-1]))
+                # print('Winodw: {} - Loss, acc lengths {}, {}'.format(avg_window,
+                #     len(self.hist['valid_loss']),
+                #     len(self.hist['valid_acc'])))
+                self.hist['avg_valid_loss'].append(np.mean(self.hist['valid_loss'][-avg_window:]))
+                self.hist['avg_valid_acc'].append(np.mean(self.hist['valid_acc'][-avg_window:]))
+
                 if hasattr(self, 'writer'):                                 
                     self.writer.add_scalar('validation/acc', acc.item(), global_step=self.hist['iter']) 
                     self.writer.add_scalar('validation/acc', acc.item(), global_step=self.hist['iter']) 
-                displayStr += ' valid_loss:{:.4f} valid_acc:{:.3f}'.format(loss, acc)
+                displayStr += ' valid_loss:{:.4f} valid_acc:{:.3f}'.format(valid_loss, valid_acc)
 
-            print(displayStr)
+            if self.verbose:
+                print(displayStr)
             self.autosave()            
             return out 
            
@@ -185,25 +320,27 @@ class NetworkBase(nn.Module):
         if device != torch.device('cpu'):   
             self.to('cpu') #make sure net is on CPU to prevent loading issues from GPU 
         
-        directory = os.path.split(filename)[0]
-        if directory != '' and not os.path.exists(directory):
-            os.makedirs(directory)
+        # directory = os.path.split(filename)[0]
+        # if directory != '' and not os.path.exists(directory):
+        #     os.makedirs(directory)
             
-        if not overwrite:
-            base, ext = os.path.splitext(filename)
-            n = 2
-            while os.path.exists(filename):
-                filename = '{}_({}){}'.format(base, n, ext)
-                n+=1
+        # if not overwrite:
+        #     base, ext = os.path.splitext(filename)
+        #     n = 2
+        #     while os.path.exists(filename):
+        #         filename = '{}_({}){}'.format(base, n, ext)
+        #         n+=1
         
         state = self.state_dict()
         state.update({'hist':self.hist})
+        if self.verbose:
+            print('  Saving net to: {}'.format(filename))
         torch.save(state, filename) 
         
         if device != torch.device('cpu'):
             self.to(device) #put the net back to device it started from
         return filename
-        
+
     
     def load(self, filename):
         state = torch.load(filename)
@@ -289,17 +426,51 @@ class StatefulBase(NetworkBase):
 ### Training ###
 ################
     
-def train_dataset(net, trainData, validBatch=None, epochs=100, batchSize=None, earlyStop=True, validStopThres=None, earlyStopValid=False): 
+def train_dataset(net, trainData, validBatch=None, epochs=100, batchSize=1, validStopThres=None, earlyStopValid=False, 
+    trainOutputMask=None, validOutputMask=None, minMaxIter=(-2, 1e7)): 
     """trainData is a TensorDataset"""    
-    net._monitor_init(trainData[:,0,:], validBatch=validBatch)
+    early_stop = False
+
+    # Only need to _monitor_init if a new threshold has begun
+    if net.newThresh:
+        # _monitor_init called with just the zeroth batch index 
+        trainOutputMaskBatch = trainOutputMask[0:batchSize, :, :] if trainOutputMask is not None else None 
+        net._monitor_init(trainData[0:batchSize,:,:], validBatch=validBatch, trainOutputMaskBatch=trainOutputMaskBatch, validOutputMask=validOutputMask)
     while net.hist['epoch'] < epochs:
         net.hist['epoch'] += 1
-        converged = net._train_epoch(trainData, validBatch=validBatch, batchSize=batchSize, earlyStop=earlyStop, validStopThres=validStopThres, earlyStopValid=earlyStopValid)  
+        converged = net._train_epoch(trainData, validBatch=validBatch, batchSize=batchSize, 
+                                     validStopThres=validStopThres, earlyStopValid=earlyStopValid, 
+                                     trainOutputMask=trainOutputMask, validOutputMask=validOutputMask,
+                                     minMaxIter=minMaxIter)  
         if converged:
-            print('Converged, stopping early.')
-            break                                    
-        
+            # print('Converged, stopping early.')
+            early_stop = True
+            break                                      
+
+        trainData, trainOutputMask = shuffle_dataset(trainData, trainOutputMask)
+
+    return early_stop
+
+def shuffle_dataset(dataSet, dataSetMask=None):
+    """ Shuffles a dataset over its batch index """
     
+    # print('Shuffling data...')
+    x, y = dataSet.tensors
+    assert x.shape[0] == y.shape[0] # Checks batch indexes are equal
+    shuffle_idxs = np.arange(x.shape[0])
+    np.random.shuffle(shuffle_idxs)
+    x = x[shuffle_idxs, :, :]
+    y = y[shuffle_idxs, :, :]
+
+    newDataSet = TensorDataset(x, y)
+    
+    if dataSetMask is not None:
+        assert x.shape[0] == dataSetMask.shape[0]
+        dataSetMask = dataSetMask[shuffle_idxs, :, :]
+    
+    return newDataSet, dataSetMask
+
+
 def train_infinite(net, gen_data, iters=float('inf'), batchSize=None, earlyStop=True):     
     trainBatch = gen_data()[:,0,:] if batchSize is None else gen_data()[:,:batchSize,:] 
     net._monitor_init(trainBatch)
@@ -421,6 +592,12 @@ def binary_classifier_accuracy(out, y):
     """Accuracy for binary-classifier-like task"""
     return (out.round() == y.round()).float().mean() #round y in case using soft labels
 
+def xe_classifier_accuracy(out, y):
+    """Accuracy for binary-classifier-like task"""
+    # print('out shape', out.shape)
+    # print('y shape', y.shape)
+
+    return (torch.argmax(out, dim=-1) == y).float().mean() 
 
 def nan_binary_classifier_accuracy(out, y):
     idx = ~torch.isnan(y)
@@ -449,9 +626,13 @@ def check_dims(W, B=None):
 def random_weight_init(dims, bias=False):
     W,B = [], []
     for l in range(len(dims)-1):
-        W.append( np.random.randn(dims[l+1], dims[l])/np.sqrt(dims[l]) )
+        # W.append(np.random.randn(dims[l+1], dims[l])/np.sqrt(dims[l]))
+        xavier_val = np.sqrt(6)/np.sqrt(dims[l] + dims[l+1])
+        W.append(np.random.uniform(low=-xavier_val, high=xavier_val, size=(dims[l+1], dims[l])))
         if bias:        
-            B.append( np.random.randn(dims[l+1]) )
+            # B.append( np.random.randn(dims[l+1]) )
+            xavier_val_b = np.sqrt(6)/np.sqrt(dims[l+1])
+            B.append(np.random.uniform(low=-xavier_val_b, high=xavier_val_b, size=(dims[l+1])))
         else:
             B.append( np.zeros(dims[l+1]) )
     check_dims(W,B) #sanity check
@@ -516,4 +697,3 @@ def load_from_file(fname, NetClass=None, dims=None):
         
 
     
-
