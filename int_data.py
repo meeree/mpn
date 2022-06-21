@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import TensorDataset
 
 
-def generateWordBank(toy_params):
+def generate_word_bank(toy_params):
     """ Creates the word bank based on various inputs """
 
     variable_length = toy_params['variable_length'] if 'variable_length' in toy_params else False
@@ -35,7 +35,7 @@ def generateWordBank(toy_params):
 
     return words
 
-def makeToyPhraseRandWords(toy_params, phrase_length):
+def make_toy_phrase_rand_words(toy_params, phrase_length):
     """ 
     Creates a single toy phrase (in word form, not tensor form) by randomly drawing from the word bank, 
     with some additional rules for certain context words. NOTE: For uniform score generation this is not used.
@@ -88,7 +88,7 @@ def makeToyPhraseRandWords(toy_params, phrase_length):
     
     return phrase
 
-def baseWordValues(toy_params):
+def base_word_values(toy_params):
     """ 
     Generates the base word values which are used to score phrases.
 
@@ -110,7 +110,7 @@ def baseWordValues(toy_params):
 
     return base_word_vals
 
-def scoreToyPhrase(toy_phrase, toy_params):
+def score_toy_phrase(toy_phrase, toy_params):
     """ 
     Scores a single toy phrase.
 
@@ -417,9 +417,9 @@ def randomTrainingExample(toy_params, ):
             score = score_vals[score_idx]
             phrase = score_to_phrase_ordered_general(score, score_to_idx_map, toy_params)
     else: # Default is to just generate phrase by randomly drawing from word bank, then score afterwards.
-        phrase = makeToyPhraseRandWords(toy_params, phrase_length)
+        phrase = make_toy_phrase_rand_words(toy_params, phrase_length)
         # Note score is not dependent upon special characters added below, so can calculate before they are added
-        score = scoreToyPhrase(phrase, toy_params)
+        score = score_toy_phrase(phrase, toy_params)
 
     if toy_params['include_sos']:
         phrase.insert(0, '<sos>')
@@ -475,9 +475,9 @@ def generate_data(dataset_size, toy_params, out_size, auto_balance=False, verbos
     if 'label_shift' not in toy_params: toy_params['label_shift']  = None
 
     if 'words' not in toy_params:
-        toy_params['words'] = generateWordBank(toy_params)
+        toy_params['words'] = generate_word_bank(toy_params)
     if 'base_word_vals' not in toy_params: # Values of each words in terms of their scores
-        toy_params['base_word_vals'] = baseWordValues(toy_params)
+        toy_params['base_word_vals'] = base_word_values(toy_params)
     if  'word_to_input_vector' not in toy_params: # Creates a unique input vector for each word
         if toy_params['input_type'] in ('one_hot', 'binary', 'binary1-1', 'binary_no_norm'):
             toy_params['word_to_input_vector'] = generateInputVectors(toy_params)
@@ -1011,7 +1011,7 @@ def enumerate_phrases(toy_params):
     scores = []
     for phrase_idx in range(total_phrases):
         phrase = index_to_phrase(phrase_idx, toy_params)
-        score = scoreToyPhrase(phrase, toy_params)
+        score = score_toy_phrase(phrase, toy_params)
         if score in score_dict:
             score_dict[score].append(phrase_idx)
         else:

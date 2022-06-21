@@ -64,6 +64,11 @@ class NetworkBase(nn.Module):
         else:
             init_string += '// Gradient clip: None'
 
+        self.paramSimilarity = kwargs.pop('paramSimilarity', None)
+        self.paramSimLambda = kwargs.pop('paramSimLambda', None)
+        if self.paramSimilarity is not None:
+            init_string += '// Param sim: {}, coef: {:.1e} '.format(self.paramSimilarity, self.paramSimLambda)      
+
         folder = os.path.normpath(kwargs.pop('folder', ''))
         filename = kwargs.pop('filename', None)
         if filename is not None and not os.path.commonprefix([os.getcwd()[::-1],folder[::-1]]):
@@ -201,6 +206,23 @@ class NetworkBase(nn.Module):
         else:
             reg_term = 0.0
 
+        if self.paramSimilarity is not None:
+            param_vecs = []
+            # Only takes certain named parameters, for now this is simply hardcoded to what we need, but would be nice to adapt later
+            for name, param in self.named_parameters():
+                if param.requires_grad and name[-4:] in ('_eta', '_lam'):    
+                    param_vecs.append(param) # Each param should be (1, 1, N)
+
+            # Each neuron gets a 2d vector, (eta, lam)
+            param_vecs = torch.cat(param_vecs, dim=1) # (1, 2, N)
+            param_vecs = torch.transpose(param_vecs, 1, 2) # (1, N, 2)
+            # Computes pairewise distance matrix, then takes only upper diag, then sums all quantities
+            dists = torch.sum(torch.triu(torch.cdist(param_vecs, param_vecs, p=2).squeeze(0), diagonal=1)) # (1, N, N) before squeeze
+
+            param_sim_term = self.paramSimLambda * dists
+        else:
+            param_sim_term = 0.0
+        
         if outputMask is None:
             print('XE probably wont work here')
             return self.loss_fn(out, batch[1]) + reg_term
@@ -222,7 +244,7 @@ class NetworkBase(nn.Module):
             # print('type masked y:', masked_y.type())
 
             # Flatten over batch and temporal indices
-            return self.loss_fn(masked_out, masked_y) + reg_term
+            return self.loss_fn(masked_out, masked_y) + reg_term + param_sim_term
 
     
     @torch.no_grad()
@@ -277,7 +299,8 @@ class NetworkBase(nn.Module):
                 self.writer.add_scalar('train/loss', loss.item(), global_step=self.hist['iter'])   
                 self.writer.add_scalar('train/acc', acc.item(), global_step=self.hist['iter'])   
                 self.writer.add_scalar('info/grad_norm', gradNorm, global_step=self.hist['iter'])
-            displayStr = 'Iter:{} grad:{:.3f} train_loss:{:.4f} train_acc:{:.3f}'.format(self.hist['iter'], gradNorm, loss, acc)                    
+            displayStr = 'Iter:{} lr:{:.3e} grad:{:.3f} train_loss:{:.4f} train_acc:{:.3f}'.format(
+                self.hist['iter'], self.optimizer.param_groups[0]['lr'], gradNorm, loss, acc)                    
             
             if validBatch is not None:
                 valid_out = self.evaluate(validBatch)
