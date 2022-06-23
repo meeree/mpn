@@ -5,7 +5,7 @@ To reproduce results from the paper, see the directory "paper".
 The code contained here can be used to construct networks with mutli-plasticity layers, including the two-layer MPN analyzed in the paper. The notebook `mpn_demonstration.ipynb` demonstrates the following three architures:
 - The two-layer MPN analyzed in the paper.
 - A three-layer MPN (first two layers have multi-plasticity)
-- A recurrent MPN, where the input and recurrent layers have multi-plasticity.
+- A recurrent MPN (input and recurrent layers have multi-plasticity).
 
 
 ### LICENSING/CONTRIBUTING NOTE:
