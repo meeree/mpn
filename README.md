@@ -1,4 +1,4 @@
-## Code used for Multi-Plasticity Networks.
+## Supporting code for Multi-Plasticity Networks.
 
 To reproduce results from the paper, see the directory "paper".
 
