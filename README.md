@@ -11,7 +11,7 @@ The code contained here can be used to construct networks with mutli-plasticity 
 ### LICENSING/CONTRIBUTING NOTE:
 The following applies to files in this repo as well as the identically named files within the "paper" directory.
 
-The LICENSING/CONTRIBUTING files listed in this repo only cover the following files:
+The LICENSING/CONTRIBUTING files in this repo only cover the following files:
 - `analysis.py`
 - `context_data.py`
 - `mpn_demonstration.ipynb`
