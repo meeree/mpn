@@ -171,9 +171,20 @@ class HebbNet(StatefulBase):
             init_string += '\n    A0: zeros'            
             self.register_buffer('A0', torch.zeros_like(torch.tensor(W2[0], dtype=torch.float)))
 
+        # Controls maximum and minimum values of modulations so weights don't change signs
+        # THIS WILL NEED TO BE CALLED MORE THAN ONCE IF INPUT WEGITHS CAN CHANGE
+        self.modulation_bounds = hebbArgs.pop('modulation_bounds', False) 
+        self.mod_bound_val = hebbArgs.pop('mod_bound_val', 1.0) 
+        if self.modulation_bounds:
+            A_bounds = None # placeholder, these are updated every update_hebb() call.
+            self.register_buffer('A_bounds', A_bounds)
+            init_string += ' // A bounded, val: {:.2f}'.format(self.mod_bound_val)
+        else:
+            init_string += ' // A unbounded'
+
         if self.verbose: # Full summary of network parameters
             print(init_string)
-
+            
         # Register_buffer                     
         self.register_buffer('A', None) 
         try:          
@@ -249,7 +260,13 @@ class HebbNet(StatefulBase):
                 if self.etaType != 'scalar':
                     raise NotImplementedError('Still need to set defaults for non-scalar eta')
                 # self.register_buffer('_eta', torch.tensor(-1.0, dtype=torch.float)) # Anti-hebbian
-                self.register_buffer('_eta', torch.tensor(1.0, dtype=torch.float))
+                if self.hebbType == 'inputOutput':
+                    self.register_buffer('_eta', torch.tensor(1.0, dtype=torch.float))
+                elif self.hebbType == 'input': # Different eta size since update terms are a slightly different magnitude in this case
+                    self.register_buffer('_eta', torch.tensor(1.0, dtype=torch.float))
+                    # self.register_buffer('_eta', torch.tensor(1.0/np.sqrt(self.n_hidden), dtype=torch.float))
+                elif self.hebbType == 'output': # Different eta size since update terms are a slightly different magnitude in this case
+                    self.register_buffer('_eta', torch.tensor(1.0/np.sqrt(self.n_inputs), dtype=torch.float))
                 self.eta = self._eta
             else:
                 self._eta = nn.Parameter(torch.tensor(eta, dtype=torch.float))    
@@ -284,20 +301,31 @@ class HebbNet(StatefulBase):
         
         # Changes to post and pre if ignoring respective neurons for update
         if self.hebbType == 'input':
-            post = torch.ones_like(post)
+            # post = torch.ones_like(post)
+            post = torch.tensor(1/np.sqrt(self.n_hidden)) * torch.ones_like(post)
         elif self.hebbType == 'output':
             pre = torch.ones_like(pre)
 
         if self.plastic: 
+
+            if self.modulation_bounds:
+                if self.updateType != 'hebb' or (self.updateType == 'hebb' and self.AAct is not None):
+                    raise NotImplementedError('Modulation bounds only implemented for Hebb updates with no activation.')
+
+                # Recalculates the modulation bounds to account for the fact that the underlying weights may have changed.
+                self.A_bounds = self.build_M_bounds()
+
             if self.groundTruthPlast: #and isFam: # only decays hebbian weights 
                 raise NotImplementedError('Broke this functionality to get around something earlier.')
                 A = self.lam*self.A
             elif self.updateType == 'hebb': # normal hebbian update
                 if self.AAct is None:
                     A = self.lam*self.A + self.eta*torch.bmm(post, pre.unsqueeze(1))
+                    if self.modulation_bounds:
+                       A = torch.clamp(A, min=self.A_bounds[1], max=self.A_bounds[0])
                 elif self.AAct == 'tanh':
                     A = torch.tanh(self.lam*self.A + self.eta*torch.bmm(post, pre.unsqueeze(1))) # [B, Nh, 1] x [B, 1, Nx] = [B, Nh, Nx]
-            elif self.updateType == 'hebb_norm': # normal hebbian update
+            elif self.updateType == 'hebb_norm': # normal hebbian update with normalization
                 A_tilde = self.lam*self.A + self.eta*torch.bmm(post, pre.unsqueeze(1)) # Normalizes over input dimension 
                 A = A_tilde / torch.norm(A_tilde, dim=2, keepdim=True) # [B, Nh, Nx] / [B, Nh, 1]
             elif self.updateType == 'oja': # For small eta, effectively normalizes A matrix.
@@ -308,6 +336,29 @@ class HebbNet(StatefulBase):
             else:
                 self.A = A
                 return None
+
+    def build_M_bounds(self):
+        """
+        Controls maximum and minimum values of modulations.
+
+        Bounds are in order: (max_vals, min_vals)
+        
+        """
+
+        if self.stpType == 'add':
+            raise NotImplementedError('Bounds for additive not yet implemented')
+        elif self.stpType == 'mult':
+            MAX_MULT = self.mod_bound_val # Controls how much a weight can be enhanced, 1.0 means the weight's mag can be doubled
+            MIN_MULT = -1 * self.mod_bound_val # Controls how much a weight can be depressed, -1.0 means it can be fully depressed 
+            M_bounds = torch.cat((
+                MAX_MULT * torch.ones_like(self.A).unsqueeze(0), 
+                MIN_MULT * torch.ones_like(self.A).unsqueeze(0)
+            ))
+            # init_string += '    {} update bounds - Max mult: {}, Min mult: {}\n'.format(cell_type, MAX_MULT, MIN_MULT)
+        else:
+            raise ValueError('MPN type not recognized in build_M_bounds.')
+
+        return M_bounds
 
     def forward(self, x, isFam=False, debug=False, stateOnly=False):
         """
