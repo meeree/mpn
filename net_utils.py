@@ -118,6 +118,10 @@ class NetworkBase(nn.Module):
             out = self.evaluate(trainBatch) #expects shape [B,T,Nx], out: [B,T,Ny]
             loss = self.average_loss(trainBatch, out=out, outputMask=trainOutputMaskBatch)
             loss.backward()
+            
+            # Zero NaNs in gradients. This can sometimes pop up with BNNs.
+            for name, param in self.named_parameters():
+                param.grad = torch.nan_to_num(param.grad, 0.0)
 
             if self.gradientClip is not None:
                 torch.nn.utils.clip_grad_norm_(self.parameters(), self.gradientClip)
@@ -668,11 +672,14 @@ class Autosave():
         self.lastSave = -1
         self.net = net
         self.saveInterval = saveInterval
-              
-    def __call__(self, force=False):
-        if self.filename is not None and (force or time.time()-self.lastSave>self.saveInterval): 
-            self.filename = self.net.save(self.filename, overwrite=False if self.lastSave<0 else True)
+        self.it = 0
+             
+    def __call__(self, force=True):
+        if self.filename is not None and (force or time.time()-self.lastSave>self.saveInterval):
+            filename = self.filename + '_' + str(self.it) + '.pt'
+            self.net.save(filename)
             self.lastSave = time.time()
+            self.it += 1
 
 
 def load_from_file(fname, NetClass=None, dims=None):
