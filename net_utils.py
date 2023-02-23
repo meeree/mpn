@@ -93,6 +93,12 @@ class NetworkBase(nn.Module):
         self.mointorFreq = kwargs.pop('monitorFreq', 10)        
         self.optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)       
         self.train() #put Module in train mode (e.g. for dropout)
+        
+        scheduler = kwargs.pop('scheduler', '')
+        self.scheduler = None
+        if scheduler == 'reducePlateau':
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min')
+        
         # with Timer() as timer:
         early_stop = train_fn(self, *args, **kwargs)                   
         self.eval() #put Module back in evaluation mode
@@ -311,6 +317,9 @@ class NetworkBase(nn.Module):
                 valid_loss = self.average_loss(validBatch, out=valid_out, outputMask=validOutputMask)  
                 valid_acc = self.accuracy(validBatch, out=valid_out, outputMask=validOutputMask) 
                 
+                if self.scheduler is not None:
+                    self.scheduler.step(valid_loss) # Scheduler will decrease LR if we hit a plateau
+                    
                 self.hist['valid_loss'].append(valid_loss.item())                
                 self.hist['valid_acc'].append(valid_acc.item())
 
