@@ -97,7 +97,7 @@ class NetworkBase(nn.Module):
         scheduler = kwargs.pop('scheduler', '')
         self.scheduler = None
         if scheduler == 'reducePlateau':
-            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, 'min')
+            self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(self.optimizer, factor = 0.5)
         
         # with Timer() as timer:
         early_stop = train_fn(self, *args, **kwargs)                   
@@ -269,6 +269,7 @@ class NetworkBase(nn.Module):
             self.hist['train_loss'] =  [] 
             self.hist['train_acc'] =  []
             self.hist['grad_norm'] =  []
+            self.hist['lr'] = []
 
             if validBatch:
                 self.hist['valid_loss'] = []
@@ -304,13 +305,14 @@ class NetworkBase(nn.Module):
             self.hist['iters_monitor'].append(self.hist['iter'])
             self.hist['train_loss'].append(loss.item())
             self.hist['train_acc'].append(acc.item()) 
-            self.hist['grad_norm'].append(gradNorm)            
+            self.hist['grad_norm'].append(gradNorm)       
+            self.hist['lr'].append(self.optimizer.param_groups[0]['lr'])
             if hasattr(self, 'writer'):
                 self.writer.add_scalar('train/loss', loss.item(), global_step=self.hist['iter'])   
                 self.writer.add_scalar('train/acc', acc.item(), global_step=self.hist['iter'])   
                 self.writer.add_scalar('info/grad_norm', gradNorm, global_step=self.hist['iter'])
             displayStr = 'Iter:{} lr:{:.3e} grad:{:.3f} train_loss:{:.4f} train_acc:{:.3f}'.format(
-                self.hist['iter'], self.optimizer.param_groups[0]['lr'], gradNorm, loss, acc)                    
+                self.hist['iter'], self.hist['lr'][-1], gradNorm, loss, acc)                    
             
             if validBatch is not None:
                 valid_out = self.evaluate(validBatch)
