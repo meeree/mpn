@@ -123,11 +123,25 @@ class NetworkBase(nn.Module):
 
             out = self.evaluate(trainBatch) #expects shape [B,T,Nx], out: [B,T,Ny]
             loss = self.average_loss(trainBatch, out=out, outputMask=trainOutputMaskBatch)
+            mx, _ = torch.max(out[:, -1, :], -1)
+            mn, _ = torch.min(out[:, -1, :], -1)
+            diff_penalty = torch.mean((mx - mn)**2)
+            # loss -= 5e-2 * diff_penalty # Want to maximize this!
             loss.backward()
             
             # Zero NaNs in gradients. This can sometimes pop up with BNNs.
+            total, corrupted = 0, 0
+            grad_norm = 0.0
             for name, param in self.named_parameters():
+                if torch.any(param.grad.isnan()):
+                    corrupted += 1
                 param.grad = torch.nan_to_num(param.grad, 0.0)
+                total += 1
+                
+                grad_norm += param.grad.norm()
+                
+            print(f'Percentage of corrupted parameters: {100 * corrupted / total}%')
+            print(f'Grad norm: {grad_norm}')
 
             if self.gradientClip is not None:
                 torch.nn.utils.clip_grad_norm_(self.parameters(), self.gradientClip)
@@ -184,10 +198,7 @@ class NetworkBase(nn.Module):
         if outputMask is None:
             return self.acc_fn(out, batch[1])
         else: # Modify output by the mask
-            masked_y = batch[1][outputMask[:, :, 0]].squeeze(-1) # [B*T_mask, 1] -> [B*T_mask]
-            masked_out = out[outputMask[:, :, 0]] # [B*T_mask, Ny]
-
-            return self.acc_fn(masked_out, masked_y)
+            return self.acc_fn(out, batch[1][:, 0, 0])
 
 
     def average_loss(self, batch, out=None, outputMask=None):
@@ -238,23 +249,8 @@ class NetworkBase(nn.Module):
             return self.loss_fn(out, batch[1]) + reg_term
         else: # Modify output by the mask
             # Last index of outputMask not needed because labels are [B, T]
-            masked_y = batch[1][outputMask[:, :, 0]].squeeze(-1) # [B*T_mask, 1] -> [B*T_mask]
-            masked_out = out[outputMask[:, :, 0]] # [B*T_mask, Ny]
-
-            # print('outputMask shape:', outputMask.shape)
-            # print('out shape:', out.shape)
-            # print('y shape:', batch[1].shape)
-            # print('masked out shape:', masked_out.shape)
-            # print('masked y shape:', masked_y.shape)
-
-            # print('masked out:', masked_out)
-            # print('masked y:', masked_y)
-
-            # print('type masked out:', masked_out.type())
-            # print('type masked y:', masked_y.type())
-
             # Flatten over batch and temporal indices
-            return self.loss_fn(masked_out, masked_y) + reg_term + param_sim_term
+            return self.loss_fn(out, batch[1][:, 0, 0]) + reg_term + param_sim_term
 
     
     @torch.no_grad()
